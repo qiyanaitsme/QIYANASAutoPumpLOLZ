@@ -1,0 +1,18 @@
+{
+    "bot": {
+        "api_token": "",
+        "img_url": "https://wallpapers-clan.com/wp-content/uploads/2024/04/dark-anime-girl-with-red-eyes-desktop-wallpaper-preview.jpg",
+        "author_url": "https://lolz.live/kqlol/"
+    },
+    "api": {
+        "base_url": "https://api.zelenka.guru",
+        "auth_token": ""
+    },
+    "database": {
+        "path": "threads.db"
+    },
+    "scheduling": {
+        "bump_interval_hours": 12,
+        "enable_auto_bump": true
+    }
+}
