@@ -1,204 +1,350 @@
+"""Telegram bot for automatic thread bumping on Lolz.live."""
+
 import asyncio
 import logging
 import sys
 from datetime import datetime
-from aiogram import Bot, Dispatcher, F
+from typing import Sequence
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 
 from config_manager import Config
-from api_client import APIClient
-from database import Database
+from api_client import APIClient, BumpResult
+from database import Database, Thread
 
 
+# Constants
+NOTIFICATION_DELAY_SECONDS = 0.8
+BUTTON_TEXT_MAX_LENGTH = 30
+AUTO_BUMP_RETRY_DELAY_SECONDS = 60
+
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('bot.log', encoding='utf-8')
+        logging.FileHandler("bot.log", encoding="utf-8")
     ]
 )
 logger = logging.getLogger(__name__)
 
 
 class BotStates(StatesGroup):
-    waiting_for_threads = State()
+    """FSM states for bot."""
+    waiting_for_thread_ids = State()
 
 
 class AutoBumpBot:
+    """Main bot class with clean separation of concerns."""
     
-    def __init__(self):
-        self.config = Config.load()
-        self.bot = Bot(token=self.config.bot_token)
-        self.storage = MemoryStorage()
-        self.dp = Dispatcher(storage=self.storage)
-        self.api = APIClient(self.config.api_base_url, self.config.api_token)
-        self.db = Database(self.config.db_path)
-        self.is_running = False
-        self.total_bumps = 0
-        self.successful_bumps = 0
-        self.start_time = None
+    __slots__ = (
+        "_config", "_bot", "_dp", "_router", "_api", "_db",
+        "_is_running", "_total_bumps", "_successful_bumps", "_start_time"
+    )
+    
+    def __init__(self, config: Config) -> None:
+        self._config = config
         
-        self.dp.message.register(self.cmd_start, Command("start"))
-        self.dp.callback_query.register(self.cb_add_thread, F.data == "add_thread")
-        self.dp.callback_query.register(self.cb_list_threads, F.data == "list_threads")
-        self.dp.callback_query.register(self.cb_delete_menu, F.data == "delete_menu")
-        self.dp.callback_query.register(self.cb_delete_thread, F.data.startswith("delete_"))
-        self.dp.callback_query.register(self.cb_bump_now, F.data == "bump_now")
-        self.dp.callback_query.register(self.cb_stats, F.data == "stats")
-        self.dp.message.register(self.msg_add_threads, StateFilter(BotStates.waiting_for_threads))
+        # Initialize bot with default properties (aiogram 3.15.0 best practice)
+        self._bot = Bot(
+            token=config.bot.api_token,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        )
+        
+        self._dp = Dispatcher(storage=MemoryStorage())
+        self._router = Router(name="main_router")
+        
+        self._api = APIClient(
+            config.api.base_url,
+            config.api.auth_token,
+            config.api.batch_size
+        )
+        self._db = Database(config.database.path)
+        
+        # Statistics
+        self._is_running = False
+        self._total_bumps = 0
+        self._successful_bumps = 0
+        self._start_time: datetime | None = None
+        
+        # Register handlers
+        self._register_handlers()
+        
+        # Include router in dispatcher
+        self._dp.include_router(self._router)
     
-    def get_main_keyboard(self) -> InlineKeyboardMarkup:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    def _register_handlers(self) -> None:
+        """Register all bot message and callback handlers."""
+        # Message handlers
+        self._router.message.register(
+            self._handle_start_command,
+            Command("start")
+        )
+        self._router.message.register(
+            self._handle_thread_ids_input,
+            StateFilter(BotStates.waiting_for_thread_ids)
+        )
+        
+        # Callback query handlers
+        self._router.callback_query.register(
+            self._handle_add_thread_callback,
+            F.data == "add_thread"
+        )
+        self._router.callback_query.register(
+            self._handle_list_threads_callback,
+            F.data == "list_threads"
+        )
+        self._router.callback_query.register(
+            self._handle_delete_menu_callback,
+            F.data == "delete_menu"
+        )
+        self._router.callback_query.register(
+            self._handle_delete_thread_callback,
+            F.data.startswith("delete_")
+        )
+        self._router.callback_query.register(
+            self._handle_bump_now_callback,
+            F.data == "bump_now"
+        )
+        self._router.callback_query.register(
+            self._handle_stats_callback,
+            F.data == "stats"
+        )
+    
+    def _create_main_menu_keyboard(self) -> InlineKeyboardMarkup:
+        """Create main menu inline keyboard."""
+        return InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="➕ Добавить темы", callback_data="add_thread"),
-                InlineKeyboardButton(text="📋 Список тем", callback_data="list_threads")
+                InlineKeyboardButton(text="➕ Add topics", callback_data="add_thread"),
+                InlineKeyboardButton(text="📋 List of topics", callback_data="list_threads")
             ],
             [
-                InlineKeyboardButton(text="🗑️ Удалить тему", callback_data="delete_menu"),
-                InlineKeyboardButton(text="🚀 Поднять темы", callback_data="bump_now")
+                InlineKeyboardButton(text="🗑️ Delete topic", callback_data="delete_menu"),
+                InlineKeyboardButton(text="🚀 Bump topics", callback_data="bump_now")
             ],
             [
-                InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
-                InlineKeyboardButton(text="👤 Автор", url="https://lolz.live/kqlol/")
+                InlineKeyboardButton(text="📊 Statistics", callback_data="stats"),
+                InlineKeyboardButton(text="👤 Author", url=self._config.bot.author_url)
             ]
         ])
-        return keyboard
     
-    async def send_main_menu(self, chat_id: int, text: str = None):
-        if text is None:
-            text = "Выберите действие:"
-        
-        await self.bot.send_message(
+    async def _send_main_menu(self, chat_id: int, text: str = "Choose an action:") -> None:
+        """Send main menu to user with photo for consistent width."""
+        await self._bot.send_photo(
             chat_id,
-            text,
-            reply_markup=self.get_main_keyboard()
+            photo=self._config.bot.img_url,
+            caption=text,
+            reply_markup=self._create_main_menu_keyboard()
         )
     
-    async def cmd_start(self, message: Message):
-        await message.answer_photo(
-            photo="https://wallpapers-clan.com/wp-content/uploads/2024/04/dark-anime-girl-with-red-eyes-desktop-wallpaper-preview.jpg",
-            caption=(
-                "🤖 <b>QIYANA AUTO-BUMP BOT</b>\n\n"
-                "Бот для автоматического поднятия тем на Lolz.live\n\n"
-                f"⏰ Автоподнятие каждые <b>{self.config.bump_interval_hours}ч</b>"
-            ),
-            parse_mode="HTML"
-        )
-        await self.send_main_menu(message.chat.id)
+    @staticmethod
+    def _truncate_text_safely(text: str, max_length: int) -> str:
+        """Safely truncate text without breaking unicode characters."""
+        if len(text) <= max_length:
+            return text
+        
+        truncated = text[:max_length]
+        try:
+            truncated.encode('utf-8')
+            return truncated
+        except UnicodeEncodeError:
+            return AutoBumpBot._truncate_text_safely(text[:max_length - 1], max_length - 1)
     
-    async def cb_add_thread(self, callback: CallbackQuery, state: FSMContext):
+    @staticmethod
+    def _calculate_uptime(start_time: datetime) -> str:
+        """Calculate uptime from start time."""
+        delta = datetime.now() - start_time
+        total_seconds = int(delta.total_seconds())
+        
+        days = total_seconds // 86400
+        hours = (total_seconds % 86400) // 3600
+        minutes = (total_seconds % 3600) // 60
+        
+        if days > 0:
+            return f"{days}д {hours}ч {minutes}м"
+        elif hours > 0:
+            return f"{hours}ч {minutes}м"
+        else:
+            return f"{minutes}м"
+    
+    async def _handle_start_command(self, message: Message) -> None:
+        """Handle /start command."""
+        try:
+            await message.answer_photo(
+                photo=self._config.bot.img_url,
+                caption=(
+                    "🤖 <b>QIYANA AUTO-BUMP BOT</b>\n\n"
+                    "Бот для автоматического поднятия тем на Lolz.live\n\n"
+                    f"⏰ Автоподнятие каждые <b>{self._config.scheduling.bump_interval_hours}ч</b>"
+                ),
+                reply_markup=self._create_main_menu_keyboard()
+            )
+        except TelegramBadRequest as e:
+            logger.error(f"Failed to send start message: {e}")
+            await message.answer("❌ Ошибка отправки сообщения. Попробуйте /start снова.")
+    
+    async def _handle_add_thread_callback(self, callback: CallbackQuery, state: FSMContext) -> None:
+        """Handle add thread button callback."""
         await callback.answer()
+        
+        if not callback.message:
+            return
+        
         await callback.message.answer(
             "📝 Введите ID тем через запятую для добавления:\n"
-            "Пример: <code>12345, 67890, 11111</code>",
-            parse_mode="HTML"
+            "Пример: <code>12345, 67890, 11111</code>"
         )
-        await state.set_state(BotStates.waiting_for_threads)
+        await state.set_state(BotStates.waiting_for_thread_ids)
     
-    async def msg_add_threads(self, message: Message, state: FSMContext):
+    async def _handle_thread_ids_input(self, message: Message, state: FSMContext) -> None:
+        """Handle thread IDs input from user."""
         try:
-            thread_ids = [tid.strip() for tid in message.text.split(',') if tid.strip()]
+            thread_ids = [tid.strip() for tid in message.text.split(",") if tid.strip()]
             
             if not thread_ids:
                 await message.answer("❌ Не указаны ID тем")
                 return
             
-            status_msg = await message.answer(f"⏳ Добавляю {len(thread_ids)} тем...")
-            
-            added = []
-            errors = []
+            # Validate format
+            valid_ids: list[str] = []
+            errors: list[str] = []
             
             for thread_id in thread_ids:
                 if not thread_id.isdigit():
                     errors.append(f"❌ {thread_id} - неверный формат")
-                    continue
-                
-                thread_info = await self.api.get_thread_info(thread_id)
-                
-                if not thread_info:
-                    errors.append(f"❌ {thread_id} - не найдена")
-                    continue
-                
-                success = await self.db.add_thread(thread_id, thread_info.title)
+                else:
+                    valid_ids.append(thread_id)
+            
+            if not valid_ids:
+                await message.answer("❌ Нет валидных ID тем")
+                return
+            
+            status_msg = await message.answer(
+                f"⏳ Добавляю {len(valid_ids)} тем в базу данных..."
+            )
+            
+            # Add threads to database directly (without fetching titles)
+            added: list[str] = []
+            
+            for thread_id in valid_ids:
+                # Use thread ID as title initially (will be fetched on first bump/list)
+                success = await self._db.add_thread(thread_id, f"Thread {thread_id}")
                 
                 if success:
-                    added.append(f"✅ {thread_id} - {thread_info.title}")
+                    added.append(f"✅ {thread_id}")
                 else:
                     errors.append(f"⚠️ {thread_id} - уже добавлена")
             
-            result = f"📊 Результат добавления:\n\n"
+            # Build result message
+            result_parts = ["📊 Результат добавления:\n"]
             
             if added:
-                result += "✅ <b>Добавлено:</b>\n" + "\n".join(added) + "\n\n"
+                result_parts.append("\n✅ <b>Добавлено:</b>\n")
+                result_parts.append("\n".join(added))
+                result_parts.append("\n")
             
             if errors:
-                result += "❌ <b>Ошибки:</b>\n" + "\n".join(errors)
+                result_parts.append("\n❌ <b>Ошибки:</b>\n")
+                result_parts.append("\n".join(errors))
             
-            await status_msg.edit_text(result, parse_mode="HTML")
-            await self.send_main_menu(message.chat.id)
+            await status_msg.edit_text("".join(result_parts))
+            await self._send_main_menu(message.chat.id)
             
         except Exception as e:
-            logger.error(f"Error adding threads: {e}", exc_info=True)
-            await message.answer(f"❌ Ошибка: {str(e)}")
+            logger.error(f"Error in thread IDs input handler: {e}", exc_info=True)
+            await message.answer(f"❌ Критическая ошибка: {str(e)}")
         finally:
             await state.clear()
     
-    async def cb_list_threads(self, callback: CallbackQuery):
+    async def _handle_list_threads_callback(self, callback: CallbackQuery) -> None:
+        """Handle list threads button callback."""
         await callback.answer()
         
+        if not callback.message:
+            return
+        
         try:
-            threads = await self.db.get_all_threads()
+            threads = await self._db.get_all_threads()
             
             if not threads:
                 await callback.message.answer("📭 Список тем пуст\n\nДобавьте темы через кнопку ➕")
-                await self.send_main_menu(callback.message.chat.id)
+                await self._send_main_menu(callback.message.chat.id)
                 return
             
-            text = f"📋 <b>Список тем ({len(threads)}):</b>\n\n"
+            # Fetch real titles from API using batch
+            status_msg = await callback.message.answer(
+                f"⏳ Загружаю информацию о {len(threads)} темах..."
+            )
             
-            for thread in threads:
+            thread_ids = [t.id for t in threads]
+            try:
+                threads_info = await self._api.get_threads_info_batch(thread_ids)
+            except Exception as e:
+                logger.error(f"Error fetching thread titles: {e}", exc_info=True)
+                threads_info = [None] * len(thread_ids)
+            
+            # Build formatted list with thread info
+            text_parts = [f"📋 <b>Список тем ({len(threads)}):</b>\n\n"]
+            
+            for thread, thread_info in zip(threads, threads_info):
+                # Use fetched title or fallback to database title
+                title = thread_info.title if thread_info else thread.title
+                
+                # Format last bump status
                 status = "🆕 Новая"
                 if thread.last_bumped:
                     try:
-                        dt = datetime.fromisoformat(thread.last_bumped.replace('Z', '+00:00'))
+                        dt = datetime.fromisoformat(thread.last_bumped.replace("Z", "+00:00"))
                         status = f"✅ {dt.strftime('%d.%m.%Y %H:%M')}"
-                    except:
+                    except ValueError:
                         status = f"✅ {thread.last_bumped[:16]}"
                 
-                text += f"<b>{thread.id}</b> - {thread.title}\n{status}\n\n"
+                # Format thread entry
+                text_parts.append(
+                    f"<b>ID:</b> {thread.id}\n"
+                    f"<b>Название:</b> {title}\n"
+                    f"<b>Статус:</b> {status}\n\n"
+                )
             
-            await callback.message.answer(text, parse_mode="HTML")
-            await self.send_main_menu(callback.message.chat.id)
+            await status_msg.edit_text("".join(text_parts))
+            await self._send_main_menu(callback.message.chat.id)
         
         except Exception as e:
             logger.error(f"Error listing threads: {e}", exc_info=True)
             await callback.message.answer(f"❌ Ошибка: {str(e)}")
     
-    async def cb_delete_menu(self, callback: CallbackQuery):
+    async def _handle_delete_menu_callback(self, callback: CallbackQuery) -> None:
+        """Handle delete menu button callback."""
         await callback.answer()
         
+        if not callback.message:
+            return
+        
         try:
-            threads = await self.db.get_all_threads()
+            threads = await self._db.get_all_threads()
             
             if not threads:
                 await callback.message.answer("📭 Список тем пуст")
-                await self.send_main_menu(callback.message.chat.id)
+                await self._send_main_menu(callback.message.chat.id)
                 return
             
-            buttons = []
-            for thread in threads:
-                button_text = f"{thread.id} - {thread.title[:30]}"
-                buttons.append([
-                    InlineKeyboardButton(
-                        text=button_text,
-                        callback_data=f"delete_{thread.id}"
-                    )
-                ])
+            buttons = [
+                [InlineKeyboardButton(
+                    text=f"{thread.id} - {self._truncate_text_safely(thread.title, BUTTON_TEXT_MAX_LENGTH)}",
+                    callback_data=f"delete_{thread.id}"
+                )]
+                for thread in threads
+            ]
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
             
@@ -211,15 +357,20 @@ class AutoBumpBot:
             logger.error(f"Error showing delete menu: {e}", exc_info=True)
             await callback.message.answer(f"❌ Ошибка: {str(e)}")
     
-    async def cb_delete_thread(self, callback: CallbackQuery):
+    async def _handle_delete_thread_callback(self, callback: CallbackQuery) -> None:
+        """Handle delete specific thread callback."""
+        if not callback.message:
+            await callback.answer("❌ Ошибка: сообщение не найдено", show_alert=True)
+            return
+        
         try:
-            thread_id = callback.data.split('_')[1]
-            success = await self.db.delete_thread(thread_id)
+            thread_id = callback.data.split("_", 1)[1]
+            success = await self._db.delete_thread(thread_id)
             
             if success:
                 await callback.answer(f"✅ Тема {thread_id} удалена", show_alert=True)
                 await callback.message.answer(f"✅ Тема {thread_id} успешно удалена из базы данных")
-                await self.send_main_menu(callback.message.chat.id)
+                await self._send_main_menu(callback.message.chat.id)
             else:
                 await callback.answer(f"❌ Тема {thread_id} не найдена", show_alert=True)
         
@@ -227,23 +378,31 @@ class AutoBumpBot:
             logger.error(f"Error deleting thread: {e}", exc_info=True)
             await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
     
-    async def cb_bump_now(self, callback: CallbackQuery):
+    async def _handle_bump_now_callback(self, callback: CallbackQuery) -> None:
+        """Handle bump now button callback."""
         await callback.answer()
         
+        if not callback.message:
+            return
+        
         try:
-            threads = await self.db.get_threads_to_bump(0)
+            threads = await self._db.get_threads_to_bump(0)
             
             if not threads:
                 await callback.message.answer("📭 Нет тем для поднятия\n\nДобавьте темы через кнопку ➕")
-                await self.send_main_menu(callback.message.chat.id)
+                await self._send_main_menu(callback.message.chat.id)
                 return
             
             status_msg = await callback.message.answer(
                 f"🚀 Начинаю поднятие {len(threads)} тем...\n\n"
+                "Используется batch API (до 10 тем за запрос)\n"
                 "Подождите, это может занять некоторое время..."
             )
             
-            results = await self.bump_threads(threads, send_to_chat=callback.message.chat.id)
+            results = await self._execute_bump_with_notifications(
+                threads,
+                chat_id=callback.message.chat.id
+            )
             
             success_count = sum(1 for r in results if r.success)
             
@@ -251,36 +410,35 @@ class AutoBumpBot:
                 f"📊 <b>Поднятие завершено!</b>\n\n"
                 f"✅ Успешно: {success_count}\n"
                 f"❌ Ошибок: {len(threads) - success_count}\n"
-                f"📝 Всего тем: {len(threads)}",
-                parse_mode="HTML"
+                f"📝 Всего тем: {len(threads)}"
             )
             
-            await self.send_main_menu(callback.message.chat.id)
+            await self._send_main_menu(callback.message.chat.id)
         
         except Exception as e:
             logger.error(f"Error bumping threads: {e}", exc_info=True)
             await callback.message.answer(f"❌ Ошибка: {str(e)}")
     
-    async def cb_stats(self, callback: CallbackQuery):
+    async def _handle_stats_callback(self, callback: CallbackQuery) -> None:
+        """Handle statistics button callback."""
         await callback.answer()
         
+        if not callback.message:
+            return
+        
         try:
-            threads = await self.db.get_all_threads()
-            threads_ready = await self.db.get_threads_to_bump(self.config.bump_interval_hours)
+            threads = await self._db.get_all_threads()
+            threads_ready = await self._db.get_threads_to_bump(
+                self._config.scheduling.bump_interval_hours
+            )
             
             uptime = "0 минут"
-            if self.start_time:
-                delta = datetime.now() - self.start_time
-                hours = delta.seconds // 3600
-                minutes = (delta.seconds % 3600) // 60
-                if hours > 0:
-                    uptime = f"{hours}ч {minutes}м"
-                else:
-                    uptime = f"{minutes}м"
+            if self._start_time:
+                uptime = self._calculate_uptime(self._start_time)
             
-            success_rate = 0
-            if self.total_bumps > 0:
-                success_rate = (self.successful_bumps / self.total_bumps) * 100
+            success_rate = 0.0
+            if self._total_bumps > 0:
+                success_rate = (self._successful_bumps / self._total_bumps) * 100
             
             text = (
                 "📊 <b>Статистика бота</b>\n\n"
@@ -289,112 +447,209 @@ class AutoBumpBot:
                 f"• Готовы к поднятию: {len(threads_ready)}\n"
                 f"• Ожидают времени: {len(threads) - len(threads_ready)}\n\n"
                 f"🚀 <b>Поднятия:</b>\n"
-                f"• Всего попыток: {self.total_bumps}\n"
-                f"• Успешных: {self.successful_bumps}\n"
+                f"• Всего попыток: {self._total_bumps}\n"
+                f"• Успешных: {self._successful_bumps}\n"
                 f"• Успешность: {success_rate:.1f}%\n\n"
                 f"⚙️ <b>Настройки:</b>\n"
-                f"• Интервал: {self.config.bump_interval_hours}ч\n"
-                f"• Задержка между темами: 2с\n\n"
+                f"• Интервал: {self._config.scheduling.bump_interval_hours}ч\n"
+                f"• Batch size: {self._config.api.batch_size}\n\n"
                 f"⏱️ <b>Работа:</b>\n"
                 f"• Время работы: {uptime}"
             )
             
-            await callback.message.answer(text, parse_mode="HTML")
-            await self.send_main_menu(callback.message.chat.id)
+            await callback.message.answer(text)
+            await self._send_main_menu(callback.message.chat.id)
         
         except Exception as e:
             logger.error(f"Error showing stats: {e}", exc_info=True)
             await callback.message.answer(f"❌ Ошибка: {str(e)}")
     
-    async def bump_threads(self, threads, send_to_chat=None):
-        results = []
+    async def _execute_bump_with_notifications(
+        self,
+        threads: Sequence[Thread],
+        chat_id: int | None = None
+    ) -> list[BumpResult]:
+        """Execute thread bumping with optional notifications."""
+        if not threads:
+            return []
         
-        for i, thread in enumerate(threads, 1):
-            result = await self.api.bump_thread(thread.id)
-            results.append(result)
-            
-            self.total_bumps += 1
+        thread_ids = [thread.id for thread in threads]
+        
+        logger.info(f"Starting bump for {len(thread_ids)} threads: {thread_ids}")
+        
+        # Use batch API to bump all threads
+        results = await self._api.bump_threads_batch(thread_ids)
+        
+        # Log detailed results
+        for result in results:
             if result.success:
-                self.successful_bumps += 1
-                await self.db.update_last_bumped(thread.id)
-            
-            if send_to_chat:
-                await self.bot.send_message(
-                    send_to_chat,
-                    f"[{i}/{len(threads)}] {result.message}"
+                logger.info(
+                    f"✅ BUMP SUCCESS | Thread: {result.thread_id} | "
+                    f"Status: {result.status.value} | Message: {result.message}"
                 )
-            
-            logger.info(f"Bump result: {result.message}")
-            
-            await asyncio.sleep(2)
+            else:
+                logger.error(
+                    f"❌ BUMP FAILED | Thread: {result.thread_id} | "
+                    f"Status: {result.status.value} | Message: {result.message}"
+                )
+        
+        # Update statistics and database
+        for result in results:
+            self._total_bumps += 1
+            if result.success:
+                self._successful_bumps += 1
+                await self._db.update_last_bumped(result.thread_id)
+                logger.info(f"Database updated for thread {result.thread_id}")
+        
+        # Send notifications if requested
+        if chat_id:
+            await self._send_bump_notifications(chat_id, results)
+        
+        # Log summary
+        success_count = sum(1 for r in results if r.success)
+        logger.info(
+            f"Batch bump completed: {success_count}/{len(results)} successful | "
+            f"Failed: {len(results) - success_count}"
+        )
         
         return results
     
-    async def auto_bump_loop(self):
-        logger.info(f"Auto-bump scheduler started (interval: {self.config.bump_interval_hours}h)")
-        logger.info("Waiting for manual first bump or timer...")
-        
-        while self.is_running:
+    async def _send_bump_notifications(self, chat_id: int, results: list[BumpResult]) -> None:
+        """Send bump result notifications to user with rate limit handling."""
+        for i, result in enumerate(results, 1):
             try:
-                sleep_seconds = self.config.bump_interval_hours * 3600
-                logger.info(f"Next scheduled bump in {self.config.bump_interval_hours} hours")
+                await self._bot.send_message(
+                    chat_id,
+                    f"[{i}/{len(results)}] {result.message}"
+                )
+                
+                # Delay between notifications to avoid rate limits
+                if i < len(results):
+                    await asyncio.sleep(NOTIFICATION_DELAY_SECONDS)
+                    
+            except TelegramRetryAfter as e:
+                # Handle rate limit - wait and retry
+                logger.warning(f"Rate limit hit, waiting {e.retry_after} seconds")
+                await asyncio.sleep(e.retry_after)
+                
+                # Retry sending this message
+                try:
+                    await self._bot.send_message(
+                        chat_id,
+                        f"[{i}/{len(results)}] {result.message}"
+                    )
+                except Exception as retry_error:
+                    logger.error(f"Failed to send notification after retry: {retry_error}")
+                    
+            except Exception as e:
+                logger.error(f"Failed to send notification: {e}")
+    
+    async def _auto_bump_scheduler_loop(self) -> None:
+        """Automatic bump scheduler loop."""
+        logger.info(
+            f"Auto-bump scheduler started (interval: {self._config.scheduling.bump_interval_hours}h)"
+        )
+        
+        while self._is_running:
+            try:
+                sleep_seconds = self._config.scheduling.bump_interval_hours * 3600
+                logger.info(f"Next scheduled bump in {self._config.scheduling.bump_interval_hours} hours")
+                
                 await asyncio.sleep(sleep_seconds)
                 
-                if not self.is_running:
+                if not self._is_running:
                     break
                 
                 logger.info("Starting scheduled bump...")
                 
-                threads = await self.db.get_threads_to_bump(self.config.bump_interval_hours)
+                threads = await self._db.get_threads_to_bump(
+                    self._config.scheduling.bump_interval_hours
+                )
                 
                 if threads:
                     logger.info(f"Found {len(threads)} threads to bump")
-                    results = await self.bump_threads(threads)
+                    results = await self._execute_bump_with_notifications(threads)
                     success_count = sum(1 for r in results if r.success)
                     logger.info(f"Scheduled bump completed: {success_count}/{len(threads)} successful")
                 else:
                     logger.info("No threads ready for scheduled bump")
                 
+            except asyncio.CancelledError:
+                logger.info("Auto-bump loop cancelled")
+                break
             except Exception as e:
                 logger.error(f"Error in auto_bump_loop: {e}", exc_info=True)
-                await asyncio.sleep(60)
+                await asyncio.sleep(AUTO_BUMP_RETRY_DELAY_SECONDS)
     
-    async def start(self):
+    async def start(self) -> None:
+        """Start bot and all services."""
         try:
-            await self.db.init()
-            logger.info("Database initialized")
+            # Initialize services
+            await self._db.connect()
+            logger.info("Database connected")
             
-            await self.api.start()
+            await self._api.start()
             logger.info("API client started")
             
-            self.start_time = datetime.now()
+            self._start_time = datetime.now()
+            self._is_running = True
             
-            self.is_running = True
-            asyncio.create_task(self.auto_bump_loop())
+            # Start auto-bump loop if enabled
+            if self._config.scheduling.enable_auto_bump:
+                asyncio.create_task(self._auto_bump_scheduler_loop())
             
             logger.info("Bot started successfully!")
-            await self.dp.start_polling(self.bot)
+            await self._dp.start_polling(self._bot)
             
         except Exception as e:
             logger.error(f"Error starting bot: {e}", exc_info=True)
+            # Cleanup on startup failure
+            await self._cleanup_resources()
             raise
     
-    async def stop(self):
+    async def stop(self) -> None:
+        """Stop bot and cleanup resources."""
         logger.info("Stopping bot...")
-        self.is_running = False
-        await self.api.close()
-        await self.bot.session.close()
+        self._is_running = False
+        await self._cleanup_resources()
         logger.info("Bot stopped")
+    
+    async def _cleanup_resources(self) -> None:
+        """Cleanup all resources safely."""
+        try:
+            await self._api.close()
+        except Exception as e:
+            logger.error(f"Error closing API client: {e}")
+        
+        try:
+            await self._db.close()
+        except Exception as e:
+            logger.error(f"Error closing database: {e}")
+        
+        try:
+            await self._bot.session.close()
+        except Exception as e:
+            logger.error(f"Error closing bot session: {e}")
 
 
-async def main():
-    bot = AutoBumpBot()
+async def main() -> None:
+    """Main entry point."""
+    try:
+        config = Config.load()
+        logger.info("Configuration loaded successfully")
+    except (FileNotFoundError, ValueError) as e:
+        logger.error(f"Configuration error: {e}")
+        sys.exit(1)
+    
+    bot = AutoBumpBot(config)
+    
     try:
         await bot.start()
     except KeyboardInterrupt:
         logger.info("Bot interrupted by user")
     except Exception as e:
         logger.error(f"Bot crashed: {e}", exc_info=True)
+        sys.exit(1)
     finally:
         await bot.stop()
 
