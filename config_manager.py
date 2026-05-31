@@ -1,14 +1,14 @@
-"""Configuration management with validation and type safety."""
+"""Configuration management with .env validation and type safety."""
 
-import json
-from pathlib import Path
+import os
 from dataclasses import dataclass
 from typing import Self
+
+from dotenv import load_dotenv
 
 
 @dataclass(frozen=True, slots=True)
 class BotConfig:
-    """Telegram bot configuration."""
     api_token: str
     img_url: str
     author_url: str
@@ -16,7 +16,6 @@ class BotConfig:
 
 @dataclass(frozen=True, slots=True)
 class APIConfig:
-    """Lolz API configuration."""
     base_url: str
     auth_token: str
     batch_size: int
@@ -24,13 +23,11 @@ class APIConfig:
 
 @dataclass(frozen=True, slots=True)
 class DatabaseConfig:
-    """Database configuration."""
     path: str
 
 
 @dataclass(frozen=True, slots=True)
 class SchedulingConfig:
-    """Scheduling configuration."""
     bump_interval_hours: float
     bump_delay_seconds: float
     enable_auto_bump: bool
@@ -38,83 +35,74 @@ class SchedulingConfig:
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Application configuration."""
     bot: BotConfig
     api: APIConfig
     database: DatabaseConfig
     scheduling: SchedulingConfig
-    
+    admin_user_id: int
+
     @classmethod
-    def load(cls, config_path: str = "config.json") -> Self:
-        """Load and validate configuration from JSON file."""
-        path = Path(config_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Config file not found: {config_path}")
-        
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        
-        # Validate required fields
-        cls._validate_config(data)
-        
-        return cls(
-            bot=BotConfig(
-                api_token=data["bot"]["api_token"],
-                img_url=data["bot"]["img_url"],
-                author_url=data["bot"]["author_url"]
-            ),
-            api=APIConfig(
-                base_url=data["api"]["base_url"].rstrip("/"),
-                auth_token=data["api"]["auth_token"],
-                batch_size=int(data["api"].get("batch_size", 10))
-            ),
-            database=DatabaseConfig(
-                path=data["database"]["path"]
-            ),
-            scheduling=SchedulingConfig(
-                bump_interval_hours=float(data["scheduling"]["bump_interval_hours"]),
-                bump_delay_seconds=float(data["scheduling"].get("bump_delay_seconds", 2)),
-                enable_auto_bump=bool(data["scheduling"]["enable_auto_bump"])
-            )
+    def load(cls, env_path: str = ".env") -> Self:
+        if not os.path.exists(env_path):
+            raise FileNotFoundError(f".env file not found: {env_path}")
+
+        load_dotenv(env_path)
+
+        bot_token = os.getenv("BOT_API_TOKEN", "")
+        api_token = os.getenv("API_AUTH_TOKEN", "")
+        admin_user_id = int(os.getenv("ADMIN_USER_ID", "0"))
+
+        cls._validate_tokens(bot_token, api_token, admin_user_id)
+
+        bot = BotConfig(
+            api_token=bot_token,
+            img_url=os.getenv("BOT_IMG_URL", ""),
+            author_url=os.getenv("BOT_AUTHOR_URL", ""),
         )
-    
+
+        batch_size = int(os.getenv("API_BATCH_SIZE", "10"))
+        if batch_size < 1 or batch_size > 10:
+            raise ValueError("API_BATCH_SIZE must be between 1 and 10")
+
+        api = APIConfig(
+            base_url=os.getenv("API_BASE_URL", "").rstrip("/"),
+            auth_token=api_token,
+            batch_size=batch_size,
+        )
+
+        db = DatabaseConfig(
+            path=os.getenv("DB_PATH", "threads.db"),
+        )
+
+        interval = float(os.getenv("BUMP_INTERVAL_HOURS", "12"))
+        if interval <= 0:
+            raise ValueError("BUMP_INTERVAL_HOURS must be positive")
+
+        scheduling = SchedulingConfig(
+            bump_interval_hours=interval,
+            bump_delay_seconds=float(os.getenv("BUMP_DELAY_SECONDS", "2")),
+            enable_auto_bump=os.getenv("ENABLE_AUTO_BUMP", "true").lower() == "true",
+        )
+
+        return cls(
+            bot=bot,
+            api=api,
+            database=db,
+            scheduling=scheduling,
+            admin_user_id=admin_user_id,
+        )
+
     @staticmethod
-    def _validate_config(data: dict) -> None:
-        """Validate configuration structure and required fields."""
-        required_fields = {
-            "bot": ["api_token", "img_url", "author_url"],
-            "api": ["base_url", "auth_token"],
-            "database": ["path"],
-            "scheduling": ["bump_interval_hours", "enable_auto_bump"]
-        }
-        
-        for section, fields in required_fields.items():
-            if section not in data:
-                raise ValueError(f"Missing config section: {section}")
-            
-            for field in fields:
-                if field not in data[section]:
-                    raise ValueError(f"Missing config field: {section}.{field}")
-                
-                value = data[section][field]
-                if isinstance(value, str) and not value.strip():
-                    raise ValueError(f"Empty config field: {section}.{field}")
-        
-        # Validate token formats
-        bot_token = data["bot"]["api_token"]
-        if "YOUR_" in bot_token or not bot_token:
-            raise ValueError("bot.api_token not configured - please set your Telegram bot token")
-        
-        api_token = data["api"]["auth_token"]
-        if "YOUR_" in api_token or not api_token:
-            raise ValueError("api.auth_token not configured - please set your Lolz API token")
-        
-        # Validate interval
-        interval = data["scheduling"]["bump_interval_hours"]
-        if not isinstance(interval, (int, float)) or interval <= 0:
-            raise ValueError("scheduling.bump_interval_hours must be positive number")
-        
-        # Validate batch size
-        batch_size = data["api"].get("batch_size", 10)
-        if not isinstance(batch_size, int) or batch_size < 1 or batch_size > 10:
-            raise ValueError("api.batch_size must be between 1 and 10")
+    def _validate_tokens(bot_token: str, api_token: str, admin_user_id: int) -> None:
+        if not bot_token or "YOUR_" in bot_token:
+            raise ValueError(
+                "BOT_API_TOKEN not configured — set your Telegram bot token in .env"
+            )
+        if not api_token or "YOUR_" in api_token:
+            raise ValueError(
+                "API_AUTH_TOKEN not configured — set your Lolz API token in .env"
+            )
+        if admin_user_id == 0:
+            raise ValueError(
+                "ADMIN_USER_ID not configured — set your Telegram user ID in .env"
+            )

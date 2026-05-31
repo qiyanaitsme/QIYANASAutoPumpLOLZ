@@ -352,10 +352,10 @@ class APIClient:
                             continue
                         
                         job_data = jobs[uri]
-                        logger.debug(f"Thread {thread_id} bump response: {job_data}")
+                        logger.info(f"Thread {thread_id} raw bump response: {job_data}")
                         
-                        # Empty dict means success for bump
-                        if isinstance(job_data, dict) and len(job_data) == 0:
+                        # Empty list [] or empty dict {} means success
+                        if isinstance(job_data, (list, dict)) and len(job_data) == 0:
                             logger.info(f"Thread {thread_id} bumped successfully (empty response)")
                             results.append(BumpResult(
                                 success=True,
@@ -364,7 +364,6 @@ class APIClient:
                                 status=BumpStatus.SUCCESS
                             ))
                         elif isinstance(job_data, dict) and "errors" in job_data:
-                            # Has errors
                             error_msg = self._extract_error_message(str(job_data["errors"]))
                             logger.error(
                                 f"Thread {thread_id} bump failed | "
@@ -377,12 +376,46 @@ class APIClient:
                                 thread_id=thread_id,
                                 status=BumpStatus.ERROR
                             ))
+                        elif isinstance(job_data, dict) and "_job_result" in job_data:
+                            job_result = str(job_data.get("_job_result", ""))
+                            job_message = str(job_data.get("_job_message", ""))
+                            if job_result == "error":
+                                error_text = job_message
+                                if not error_text.strip():
+                                    errors = job_data.get("errors")
+                                    if errors:
+                                        if isinstance(errors, list):
+                                            error_text = str(errors[0]) if errors else ""
+                                        elif isinstance(errors, str):
+                                            error_text = errors
+                                        else:
+                                            error_text = str(errors)
+                                if not error_text.strip():
+                                    error_text = str(job_data.get("error", ""))
+                                error_msg = self._extract_error_message(error_text) or "Ошибка API (см. логи)"
+                                logger.error(
+                                    f"Thread {thread_id} bump failed | "
+                                    f"Job error: {error_msg}"
+                                )
+                                results.append(BumpResult(
+                                    success=False,
+                                    message=f"Тема {thread_id}: {error_msg}",
+                                    thread_id=thread_id,
+                                    status=BumpStatus.ERROR
+                                ))
+                            else:
+                                logger.info(f"Thread {thread_id} bumped successfully (job_result={job_result}, job_message={job_message})")
+                                results.append(BumpResult(
+                                    success=True,
+                                    message=f"✅ Тема {thread_id} поднята успешно",
+                                    thread_id=thread_id,
+                                    status=BumpStatus.SUCCESS
+                                ))
                         else:
-                            # Unknown response
-                            logger.warning(f"Thread {thread_id} unknown bump response: {job_data}")
+                            logger.warning(f"Thread {thread_id} unknown bump response (type={type(job_data).__name__}): {job_data}")
                             results.append(BumpResult(
                                 success=False,
-                                message=f"Тема {thread_id}: Неизвестный ответ",
+                                message=f"Тема {thread_id}: Неизвестный ответ ({type(job_data).__name__})",
                                 thread_id=thread_id,
                                 status=BumpStatus.ERROR
                             ))
