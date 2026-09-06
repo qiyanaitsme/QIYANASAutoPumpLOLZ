@@ -6,6 +6,9 @@ from typing import Self
 
 from dotenv import load_dotenv
 
+# Official API servers per forum.json (spec): production + documented alternates
+DEFAULT_API_BASE_URL = "https://api.lolz.live"
+
 
 @dataclass(frozen=True, slots=True)
 class BotConfig:
@@ -28,9 +31,10 @@ class DatabaseConfig:
 
 @dataclass(frozen=True, slots=True)
 class SchedulingConfig:
-    bump_interval_hours: float
+    bump_interval_minutes: float
     bump_delay_seconds: float
     enable_auto_bump: bool
+    scheduler_tick_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +54,13 @@ class Config:
 
         bot_token = os.getenv("BOT_API_TOKEN", "")
         api_token = os.getenv("API_AUTH_TOKEN", "")
-        admin_user_id = int(os.getenv("ADMIN_USER_ID", "0"))
+
+        try:
+            admin_user_id = int(os.getenv("ADMIN_USER_ID", "0"))
+        except ValueError:
+            raise ValueError(
+                "ADMIN_USER_ID must be an integer — set your Telegram user ID in .env"
+            )
 
         cls._validate_tokens(bot_token, api_token, admin_user_id)
 
@@ -65,7 +75,7 @@ class Config:
             raise ValueError("API_BATCH_SIZE must be between 1 and 10")
 
         api = APIConfig(
-            base_url=os.getenv("API_BASE_URL", "").rstrip("/"),
+            base_url=os.getenv("API_BASE_URL", DEFAULT_API_BASE_URL).rstrip("/"),
             auth_token=api_token,
             batch_size=batch_size,
         )
@@ -74,14 +84,19 @@ class Config:
             path=os.getenv("DB_PATH", "threads.db"),
         )
 
-        interval = float(os.getenv("BUMP_INTERVAL_HOURS", "12"))
-        if interval <= 0:
-            raise ValueError("BUMP_INTERVAL_HOURS must be positive")
+        interval_minutes = float(os.getenv("BUMP_INTERVAL_MINUTES", "60"))
+        if interval_minutes <= 0:
+            raise ValueError("BUMP_INTERVAL_MINUTES must be positive")
+
+        tick = float(os.getenv("SCHEDULER_TICK_SECONDS", "60"))
+        if tick <= 0:
+            raise ValueError("SCHEDULER_TICK_SECONDS must be positive")
 
         scheduling = SchedulingConfig(
-            bump_interval_hours=interval,
+            bump_interval_minutes=interval_minutes,
             bump_delay_seconds=float(os.getenv("BUMP_DELAY_SECONDS", "2")),
             enable_auto_bump=os.getenv("ENABLE_AUTO_BUMP", "true").lower() == "true",
+            scheduler_tick_seconds=tick,
         )
 
         return cls(

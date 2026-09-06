@@ -1,4 +1,5 @@
-"""Telegram bot for automatic thread bumping on Lolz.live — with dynamic settings & auth."""
+"""Telegram bot for automatic thread bumping on Lolz.live — tick-based scheduler,
+batch API, forum-backed thread listing."""
 
 import asyncio
 import logging
@@ -24,6 +25,7 @@ from database import Database, BumpStats, Thread
 
 NOTIFICATION_DELAY_SECONDS = 0.8
 BUTTON_TEXT_MAX_LENGTH = 30
+MY_THREADS_PAGE_SIZE = 10
 AUTO_BUMP_RETRY_DELAY_SECONDS = 60
 
 
@@ -36,6 +38,17 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+
+def _format_interval(minutes: float) -> str:
+    """Human-friendly interval: minutes below an hour, trimmed decimals above."""
+    if minutes < 60:
+        if minutes == int(minutes):
+            return f"{int(minutes)} мин"
+        return f"{minutes:.1f} мин"
+    hours = minutes / 60
+    text = f"{hours:.2f}".rstrip("0").rstrip(".")
+    return f"{text}ч"
 
 
 class BotStates(StatesGroup):
@@ -110,6 +123,7 @@ class AutoBumpBot:
             config.api.base_url,
             config.api.auth_token,
             config.api.batch_size,
+            config.scheduling.bump_delay_seconds,
         )
         self._db = Database(config.database.path)
 
@@ -147,6 +161,10 @@ class AutoBumpBot:
         self._router.callback_query.register(self._handle_bump_now_callback, F.data == "bump_now")
         self._router.callback_query.register(self._handle_stats_callback, F.data == "stats")
         self._router.callback_query.register(self._handle_refresh_titles_callback, F.data == "refresh_titles")
+        self._router.callback_query.register(self._handle_my_threads_callback, F.data == "my_threads")
+        self._router.callback_query.register(self._handle_my_threads_page_callback, F.data.startswith("mypage_"))
+        self._router.callback_query.register(self._handle_my_add_callback, F.data.startswith("myadd_"))
+        self._router.callback_query.register(self._handle_noop_callback, F.data == "noop")
         self._router.callback_query.register(self._handle_settings_callback, F.data == "settings")
         self._router.callback_query.register(self._handle_set_interval_callback, F.data == "set_interval")
         self._router.callback_query.register(self._handle_set_batch_size_callback, F.data == "set_batch_size")
@@ -159,18 +177,21 @@ class AutoBumpBot:
         return InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="➕ Add topics", callback_data="add_thread"),
+                InlineKeyboardButton(text="📥 My topics", callback_data="my_threads"),
+            ],
+            [
                 InlineKeyboardButton(text="📋 List of topics", callback_data="list_threads"),
-            ],
-            [
                 InlineKeyboardButton(text="🗑️ Delete topic", callback_data="delete_menu"),
+            ],
+            [
                 InlineKeyboardButton(text="🚀 Bump topics", callback_data="bump_now"),
-            ],
-            [
                 InlineKeyboardButton(text="🔄 Refresh", callback_data="refresh_titles"),
-                InlineKeyboardButton(text="📊 Statistics", callback_data="stats"),
             ],
             [
+                InlineKeyboardButton(text="📊 Statistics", callback_data="stats"),
                 InlineKeyboardButton(text="🛠️ Settings", callback_data="settings"),
+            ],
+            [
                 InlineKeyboardButton(text="👤 Author", url=self._config.bot.author_url),
             ],
         ])
@@ -184,12 +205,15 @@ class AutoBumpBot:
         ])
 
     async def _send_main_menu(self, chat_id: int, text: str = "Choose an action:") -> None:
-        await self._bot.send_photo(
-            chat_id,
-            photo=self._config.bot.img_url,
-            caption=text,
-            reply_markup=self._main_menu_kb(),
-        )
+        markup = self._main_menu_kb()
+        img_url = self._config.bot.img_url
+        if img_url:
+            try:
+                await self._bot.send_photo(chat_id, photo=img_url, caption=text, reply_markup=markup)
+                return
+            except TelegramBadRequest as e:
+                logger.warning(f"send_photo failed, falling back to text message: {e}")
+        await self._bot.send_message(chat_id, text, reply_markup=markup)
 
     # ─── Utilities ──────────────────────────────────────────────
 
@@ -218,8 +242,8 @@ class AutoBumpBot:
         else:
             return f"{minutes}m"
 
-    async def _get_interval(self) -> float:
-        val = await self._db.get_setting("bump_interval_hours", "12")
+    async def _get_interval_minutes(self) -> float:
+        val = await self._db.get_setting("bump_interval_minutes", "60")
         return float(val)
 
     async def _get_batch_size(self) -> int:
@@ -234,15 +258,14 @@ class AutoBumpBot:
 
     async def _handle_start_command(self, message: Message) -> None:
         try:
-            interval = await self._get_interval()
-            await message.answer_photo(
-                photo=self._config.bot.img_url,
-                caption=(
+            interval = await self._get_interval_minutes()
+            await self._send_main_menu(
+                message.chat.id,
+                text=(
                     "🤖 <b>QIYANA AUTO-BUMP BOT</b>\n\n"
                     "Бот для автоматического поднятия тем на Lolz.live\n\n"
-                    f"⏰ Автоподнятие каждые <b>{interval:.0f}ч</b>"
+                    f"⏰ Автоподнятие каждые <b>{_format_interval(interval)}</b>"
                 ),
-                reply_markup=self._main_menu_kb(),
             )
         except TelegramBadRequest as e:
             logger.error(f"Failed to send start message: {e}")
@@ -256,7 +279,8 @@ class AutoBumpBot:
             return
         await callback.message.answer(
             "📝 Введите ID тем через запятую для добавления:\n"
-            "Пример: <code>12345, 67890, 11111</code>"
+            "Пример: <code>12345, 67890, 11111</code>\n\n"
+            "Или добавьте свои темы с форума через кнопку 📥 <b>My topics</b>"
         )
         await state.set_state(BotStates.waiting_for_thread_ids)
 
@@ -289,9 +313,9 @@ class AutoBumpBot:
             titles_map: dict[str, str] = {}
             try:
                 threads_info = await self._api.get_threads_info_batch(valid_ids)
-                for i, info in enumerate(threads_info):
-                    tid = valid_ids[i]
-                    titles_map[tid] = info.title if info else f"Thread {tid}"
+                for tid, info in zip(valid_ids, threads_info):
+                    if info and info.title:
+                        titles_map[tid] = info.title
             except Exception as e:
                 logger.error(f"Error fetching titles during add: {e}")
                 for tid in valid_ids:
@@ -333,7 +357,7 @@ class AutoBumpBot:
         try:
             threads = await self._db.get_all_threads()
             if not threads:
-                await callback.message.answer("📭 Список тем пуст\n\nДобавьте темы через кнопку ➕")
+                await callback.message.answer("📭 Список тем пуст\n\nДобавьте темы через кнопку ➕ или 📥")
                 await self._send_main_menu(callback.message.chat.id)
                 return
 
@@ -361,7 +385,7 @@ class AutoBumpBot:
             logger.error(f"Error listing threads: {e}", exc_info=True)
             await callback.message.answer(f"❌ Ошибка: {str(e)}")
 
-    # ─── Refresh Titles ─────────────────────────────────────────
+    # ─── Refresh (titles sync) ──────────────────────────────────
 
     async def _handle_refresh_titles_callback(self, callback: CallbackQuery) -> None:
         await callback.answer()
@@ -382,9 +406,9 @@ class AutoBumpBot:
             threads_info = await self._api.get_threads_info_batch(thread_ids)
 
             updated = 0
-            for i, info in enumerate(threads_info):
-                if info and info.title and info.title != threads[i].title:
-                    await self._db.update_thread_title(threads[i].id, info.title)
+            for info, thread in zip(threads_info, threads):
+                if info and info.title and info.title != thread.title:
+                    await self._db.update_thread_title(thread.id, info.title)
                     updated += 1
 
             await status_msg.edit_text(
@@ -398,6 +422,104 @@ class AutoBumpBot:
         except Exception as e:
             logger.error(f"Error refreshing titles: {e}", exc_info=True)
             await callback.message.answer(f"❌ Ошибка обновления: {str(e)}")
+
+    # ─── My Topics (forum listing) ─────────────────────────────
+
+    async def _handle_my_threads_callback(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        if not callback.message:
+            return
+        await self._show_my_threads(callback.message.chat.id, page=1)
+
+    async def _handle_my_threads_page_callback(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        if not callback.message:
+            return
+        try:
+            page = int(callback.data.split("_", 1)[1])
+        except ValueError:
+            page = 1
+        await self._show_my_threads(callback.message.chat.id, page=max(1, page),
+                                    message_to_edit=callback.message)
+
+    async def _show_my_threads(
+        self, chat_id: int, page: int = 1, message_to_edit: Message | None = None
+    ) -> None:
+        try:
+            page_data = await self._api.get_my_threads(page=page, limit=MY_THREADS_PAGE_SIZE)
+        except Exception as e:
+            logger.error(f"Error fetching my threads: {e}", exc_info=True)
+            text = f"❌ Не удалось получить список тем с форума: {e}"
+            if message_to_edit:
+                try:
+                    await message_to_edit.edit_text(text)
+                except TelegramBadRequest:
+                    pass
+            else:
+                await self._bot.send_message(chat_id, text)
+            return
+
+        total_pages = max(1, -(-page_data.total // MY_THREADS_PAGE_SIZE))
+
+        if not page_data.threads:
+            text = "📭 Ваши темы на форуме не найдены (или токен не даёт их видеть)"
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ Back to Menu", callback_data="back_to_menu")],
+            ])
+        else:
+            buttons: list[list[InlineKeyboardButton]] = []
+            for t in page_data.threads:
+                title = self._truncate_text_safely(t.title or f"Thread {t.thread_id}", 60)
+                buttons.append([
+                    InlineKeyboardButton(text=title, callback_data=f"myadd_{t.thread_id}")
+                ])
+
+            nav: list[InlineKeyboardButton] = []
+            if page > 1:
+                nav.append(InlineKeyboardButton(text="◀️", callback_data=f"mypage_{page - 1}"))
+            nav.append(InlineKeyboardButton(text=f"📄 {page}/{total_pages}", callback_data="noop"))
+            if page < total_pages:
+                nav.append(InlineKeyboardButton(text="▶️", callback_data=f"mypage_{page + 1}"))
+            buttons.append(nav)
+            buttons.append([InlineKeyboardButton(text="↩️ Back to Menu", callback_data="back_to_menu")])
+
+            text = (
+                f"📥 <b>Мои темы</b> — страница {page}/{total_pages}"
+                f" (всего {page_data.total})\n\n"
+                "Нажмите на тему, чтобы добавить её в список бампа."
+            )
+            markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+        if message_to_edit:
+            try:
+                await message_to_edit.edit_text(text, reply_markup=markup)
+            except TelegramBadRequest:
+                pass
+        else:
+            await self._bot.send_message(chat_id, text, reply_markup=markup)
+
+    async def _handle_my_add_callback(self, callback: CallbackQuery) -> None:
+        if not callback.data:
+            return
+        thread_id = callback.data.split("_", 1)[1]
+        try:
+            info_list = await self._api.get_threads_info_batch([thread_id])
+            info = info_list[0] if info_list else None
+        except Exception as e:
+            logger.error(f"Error fetching thread {thread_id} for add: {e}")
+            await callback.answer(f"❌ Ошибка получения темы: {e}", show_alert=True)
+            return
+
+        title = (info.title if info and info.title else f"Thread {thread_id}")
+        added = await self._db.add_thread(thread_id, title)
+        if added:
+            logger.info(f"Thread {thread_id} added from my-topics listing")
+            await callback.answer(f"✅ Добавлена: {title}")
+        else:
+            await callback.answer("⚠️ Тема уже в списке", show_alert=True)
+
+    async def _handle_noop_callback(self, callback: CallbackQuery) -> None:
+        await callback.answer()
 
     # ─── Delete Thread ──────────────────────────────────────────
 
@@ -451,9 +573,9 @@ class AutoBumpBot:
         if not callback.message:
             return
         try:
-            threads = await self._db.get_threads_to_bump(0)
+            threads = await self._db.get_all_threads()
             if not threads:
-                await callback.message.answer("📭 Нет тем для поднятия\n\nДобавьте темы через кнопку ➕")
+                await callback.message.answer("📭 Нет тем для поднятия\n\nДобавьте темы через кнопку ➕ или 📥")
                 await self._send_main_menu(callback.message.chat.id)
                 return
 
@@ -488,7 +610,7 @@ class AutoBumpBot:
             return
         try:
             threads = await self._db.get_all_threads()
-            interval = await self._get_interval()
+            interval = await self._get_interval_minutes()
             threads_ready = await self._db.get_threads_to_bump(interval)
             stats = await self._db.get_bump_stats()
             batch_size = await self._get_batch_size()
@@ -514,7 +636,7 @@ class AutoBumpBot:
                 f"• Успешность: {success_rate:.1f}%\n"
                 f"• Последний бамп: {stats.last_bump_time or '—'}\n\n"
                 f"⚙️ <b>Настройки:</b>\n"
-                f"• Интервал: {interval:.0f}ч\n"
+                f"• Интервал: {_format_interval(interval)}\n"
                 f"• Batch size: {batch_size}\n"
                 f"• Автобамп: {'✅ Вкл' if auto_enabled else '❌ Выкл'}\n\n"
                 f"⏱️ <b>Работа:</b>\n"
@@ -534,13 +656,13 @@ class AutoBumpBot:
         await callback.answer()
         if not callback.message:
             return
-        interval = await self._get_interval()
+        interval = await self._get_interval_minutes()
         batch_size = await self._get_batch_size()
         auto_enabled = await self._is_auto_bump_enabled()
 
         text = (
             "🛠️ <b>Текущие настройки</b>\n\n"
-            f"⏰ Интервал бампа: <b>{interval:.0f}ч</b>\n"
+            f"⏰ Интервал бампа: <b>{_format_interval(interval)}</b>\n"
             f"📦 Batch size: <b>{batch_size}</b>\n"
             f"🔄 Автобамп: <b>{'✅ Вкл' if auto_enabled else '❌ Выкл'}</b>\n"
         )
@@ -550,10 +672,10 @@ class AutoBumpBot:
         await callback.answer()
         if not callback.message:
             return
-        interval = await self._get_interval()
+        interval = await self._get_interval_minutes()
         await callback.message.answer(
-            f"Текущий интервал: <b>{interval:.0f}ч</b>\n\n"
-            "Введите новый интервал в часах (например: <code>6</code> или <code>24</code>):"
+            f"Текущий интервал: <b>{_format_interval(interval)}</b>\n\n"
+            "Введите новый интервал в минутах (например: <code>5</code> или <code>720</code>):"
         )
         await state.set_state(BotStates.waiting_for_interval)
 
@@ -564,18 +686,15 @@ class AutoBumpBot:
                 await message.answer("❌ Интервал должен быть положительным числом")
                 return
 
-            await self._db.set_setting("bump_interval_hours", str(new_interval))
-            logger.info(f"Bump interval changed to {new_interval}h by user {message.from_user.id}")
+            await self._db.set_setting("bump_interval_minutes", str(new_interval))
+            logger.info(f"Bump interval changed to {new_interval} min by user {message.from_user.id}")
 
-            # Restart auto-bump loop if running
-            if self._is_running and await self._is_auto_bump_enabled():
-                self._restart_auto_bump()
-
-            await message.answer(f"✅ Интервал изменён на <b>{new_interval:.0f}ч</b>")
+            # Tick-based scheduler picks up the new interval on the next tick — no restart needed
+            await message.answer(f"✅ Интервал изменён на <b>{_format_interval(new_interval)}</b>")
             await self._send_main_menu(message.chat.id)
 
         except ValueError:
-            await message.answer("❌ Введите число (например: <code>12</code>)")
+            await message.answer("❌ Введите число минут (например: <code>5</code>)")
         except Exception as e:
             logger.error(f"Error changing interval: {e}")
             await message.answer(f"❌ Ошибка: {str(e)}")
@@ -601,7 +720,7 @@ class AutoBumpBot:
                 return
 
             await self._db.set_setting("batch_size", str(new_size))
-            self._api._batch_size = new_size
+            self._api.set_batch_size(new_size)
             logger.info(f"Batch size changed to {new_size} by user {message.from_user.id}")
 
             await message.answer(f"✅ Batch size изменён на <b>{new_size}</b>")
@@ -628,6 +747,7 @@ class AutoBumpBot:
             self._restart_auto_bump()
             status = "✅ Включён"
         else:
+            self._stop_auto_bump()
             status = "❌ Выключен"
 
         logger.info(f"Auto-bump toggled to {new_state} by user {callback.from_user.id}")
@@ -655,23 +775,20 @@ class AutoBumpBot:
 
         results = await self._api.bump_threads_batch(thread_ids)
 
+        success_count = 0
         for result in results:
             if result.success:
+                success_count += 1
                 logger.info(
                     f"✅ BUMP SUCCESS | Thread: {result.thread_id} | "
                     f"Status: {result.status.value} | Message: {result.message}"
                 )
+                await self._db.update_last_bumped(result.thread_id)
             else:
                 logger.error(
                     f"❌ BUMP FAILED | Thread: {result.thread_id} | "
                     f"Status: {result.status.value} | Message: {result.message}"
                 )
-
-        success_count = 0
-        for result in results:
-            if result.success:
-                success_count += 1
-                await self._db.update_last_bumped(result.thread_id)
 
         total = len(results)
         await self._db.increment_bump_stats(success_count, total)
@@ -702,40 +819,45 @@ class AutoBumpBot:
             except Exception as e:
                 logger.error(f"Failed to send notification: {e}")
 
-    # ─── Auto-Bump Scheduler ───────────────────────────────────
+    # ─── Auto-Bump Scheduler (tick-based) ──────────────────────
 
     def _restart_auto_bump(self) -> None:
-        if self._auto_bump_task and not self._auto_bump_task.done():
-            self._auto_bump_task.cancel()
+        self._stop_auto_bump()
         self._auto_bump_task = asyncio.create_task(self._auto_bump_scheduler_loop())
 
+    def _stop_auto_bump(self) -> None:
+        if self._auto_bump_task and not self._auto_bump_task.done():
+            self._auto_bump_task.cancel()
+        self._auto_bump_task = None
+
     async def _auto_bump_scheduler_loop(self) -> None:
-        logger.info("Auto-bump scheduler started")
+        """Tick every SCHEDULER_TICK_SECONDS: read settings from DB, bump due threads.
+
+        Reads interval/auto-bump from the DB on every tick, so settings changes
+        apply immediately without restarting the loop and without losing phase.
+        """
+        tick_seconds = self._config.scheduling.scheduler_tick_seconds
+        logger.info(f"Auto-bump scheduler started (tick every {tick_seconds:.0f}s)")
         while self._is_running:
             try:
-                interval = await self._get_interval()
-                sleep_seconds = interval * 3600
-                logger.info(f"Next scheduled bump in {interval:.0f} hours")
-                await asyncio.sleep(sleep_seconds)
-
+                await asyncio.sleep(tick_seconds)
                 if not self._is_running:
                     break
 
-                auto_enabled = await self._is_auto_bump_enabled()
-                if not auto_enabled:
-                    logger.info("Auto-bump disabled, skipping cycle")
+                if not await self._is_auto_bump_enabled():
                     continue
 
-                logger.info("Starting scheduled bump...")
+                interval = await self._get_interval_minutes()
                 threads = await self._db.get_threads_to_bump(interval)
+                if not threads:
+                    continue
 
-                if threads:
-                    logger.info(f"Found {len(threads)} threads to bump")
-                    results = await self._execute_bump_with_notifications(threads)
-                    success_count = sum(1 for r in results if r.success)
-                    logger.info(f"Scheduled bump completed: {success_count}/{len(threads)} successful")
-                else:
-                    logger.info("No threads ready for scheduled bump")
+                logger.info(f"Auto-bump: {len(threads)} threads are due")
+                results = await self._execute_bump_with_notifications(threads, chat_id=None)
+                success_count = sum(1 for r in results if r.success)
+                logger.info(
+                    f"Scheduled bump completed: {success_count}/{len(results)} successful"
+                )
 
             except asyncio.CancelledError:
                 logger.info("Auto-bump loop cancelled")
@@ -757,6 +879,17 @@ class AutoBumpBot:
             await self._api.start()
             logger.info("API client started")
 
+            # Validate the Lolz API token early so misconfiguration is visible immediately
+            me = await self._api.get_me()
+            if me:
+                logger.info(
+                    f"API token OK | user_id={me.get('user_id', '?')} username={me.get('username', '?')}"
+                )
+            else:
+                logger.warning(
+                    "API token validation failed — bumps will likely fail until API_AUTH_TOKEN is fixed"
+                )
+
             self._start_time = datetime.now()
             self._is_running = True
 
@@ -774,8 +907,7 @@ class AutoBumpBot:
     async def stop(self) -> None:
         logger.info("Stopping bot...")
         self._is_running = False
-        if self._auto_bump_task and not self._auto_bump_task.done():
-            self._auto_bump_task.cancel()
+        self._stop_auto_bump()
         await self._cleanup_resources()
         logger.info("Bot stopped")
 

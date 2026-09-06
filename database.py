@@ -111,8 +111,7 @@ class Database:
 
     async def _seed_settings(self, config: Config) -> None:
         defaults = {
-            "bump_interval_hours": str(config.scheduling.bump_interval_hours),
-            "bump_delay_seconds": str(config.scheduling.bump_delay_seconds),
+            "bump_interval_minutes": str(config.scheduling.bump_interval_minutes),
             "enable_auto_bump": str(config.scheduling.enable_auto_bump).lower(),
             "batch_size": str(config.api.batch_size),
         }
@@ -228,19 +227,20 @@ class Database:
             logger.error(f"Error fetching all threads: {e}")
             raise
 
-    async def get_threads_to_bump(self, interval_hours: float) -> list[Thread]:
+    async def get_threads_to_bump(self, interval_minutes: float) -> list[Thread]:
+        """Threads due for a bump: the interval has passed since the last one."""
         self._ensure_connected()
-        if interval_hours < 0:
-            raise ValueError("interval_hours must be non-negative")
+        if interval_minutes < 0:
+            raise ValueError("interval_minutes must be non-negative")
         try:
             async with self._connection.execute(
                 """
                 SELECT id, title, last_bumped FROM threads
                 WHERE last_bumped IS NULL
-                   OR datetime(last_bumped, '+' || ? || ' hours') <= datetime('now')
+                   OR datetime(last_bumped, '+' || ? || ' minutes') <= datetime('now')
                 ORDER BY last_bumped ASC NULLS FIRST
                 """,
-                (interval_hours,),
+                (interval_minutes,),
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [Thread(id=row[0], title=row[1], last_bumped=row[2]) for row in rows]
