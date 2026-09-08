@@ -94,7 +94,7 @@ class Config:
 
         scheduling = SchedulingConfig(
             bump_interval_minutes=interval_minutes,
-            bump_delay_seconds=float(os.getenv("BUMP_DELAY_SECONDS", "2")),
+            bump_delay_seconds=float(os.getenv("BUMP_DELAY_SECONDS", "1")),
             enable_auto_bump=os.getenv("ENABLE_AUTO_BUMP", "true").lower() == "true",
             scheduler_tick_seconds=tick,
         )

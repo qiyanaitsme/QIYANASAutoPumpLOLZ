@@ -68,18 +68,22 @@ class AuthMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        from_user = getattr(event, "from_user", None)
-        if from_user is None:
-            cq = getattr(event, "callback_query", None)
-            if cq is not None:
-                from_user = cq.from_user
-            else:
-                msg = getattr(event, "message", None)
-                if msg is not None:
-                    from_user = msg.from_user
+        # `event` is the raw Update; `.event` resolves it to whichever concrete
+        # sub-object is actually set (message, callback_query, chat_member, ...).
+        try:
+            actual_event = event.event
+        except Exception:
+            actual_event = event
+        from_user = getattr(actual_event, "from_user", None)
 
         if from_user is None:
-            return await handler(event, data)
+            # Unknown identity (e.g. channel_post, poll, message_reaction) — fail
+            # closed instead of letting it through unauthenticated.
+            logger.warning(
+                f"AuthMiddleware: update without from_user "
+                f"(type={getattr(event, 'event_type', '?')}), denying"
+            )
+            return None
 
         if from_user.id != self._admin_user_id:
             chat_id = None
@@ -267,8 +271,8 @@ class AutoBumpBot:
                     f"⏰ Автоподнятие каждые <b>{_format_interval(interval)}</b>"
                 ),
             )
-        except TelegramBadRequest as e:
-            logger.error(f"Failed to send start message: {e}")
+        except Exception as e:
+            logger.error(f"Failed to send start message: {e}", exc_info=True)
             await message.answer("❌ Ошибка отправки сообщения. Попробуйте /start снова.")
 
     # ─── Add Thread ─────────────────────────────────────────────
@@ -783,12 +787,13 @@ class AutoBumpBot:
                     f"✅ BUMP SUCCESS | Thread: {result.thread_id} | "
                     f"Status: {result.status.value} | Message: {result.message}"
                 )
-                await self._db.update_last_bumped(result.thread_id)
+                await self._db.record_bump_success(result.thread_id)
             else:
                 logger.error(
                     f"❌ BUMP FAILED | Thread: {result.thread_id} | "
                     f"Status: {result.status.value} | Message: {result.message}"
                 )
+                await self._db.record_bump_failure(result.thread_id)
 
         total = len(results)
         await self._db.increment_bump_stats(success_count, total)

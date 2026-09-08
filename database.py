@@ -73,13 +73,30 @@ class Database:
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
                     last_bumped TEXT,
+                    last_attempt TEXT,
+                    fail_streak INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
+            # Migration for DBs created before last_attempt/fail_streak existed.
+            async with self._connection.execute("PRAGMA table_info(threads)") as cursor:
+                existing_columns = {row[1] for row in await cursor.fetchall()}
+            if "last_attempt" not in existing_columns:
+                await self._connection.execute("ALTER TABLE threads ADD COLUMN last_attempt TEXT")
+            if "fail_streak" not in existing_columns:
+                await self._connection.execute(
+                    "ALTER TABLE threads ADD COLUMN fail_streak INTEGER NOT NULL DEFAULT 0"
+                )
+
             await self._connection.execute("""
                 CREATE INDEX IF NOT EXISTS idx_last_bumped
                 ON threads(last_bumped)
+            """)
+
+            await self._connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_last_attempt
+                ON threads(last_attempt)
             """)
 
             await self._connection.execute("""
@@ -228,7 +245,12 @@ class Database:
             raise
 
     async def get_threads_to_bump(self, interval_minutes: float) -> list[Thread]:
-        """Threads due for a bump: the interval has passed since the last one."""
+        """Threads due for a bump: the interval has passed since the last attempt.
+
+        Threads that keep failing back off exponentially (interval * 2**fail_streak,
+        capped at 60x) so a permanently broken thread doesn't get retried on every
+        single tick and burn through the batch rate limit.
+        """
         self._ensure_connected()
         if interval_minutes < 0:
             raise ValueError("interval_minutes must be non-negative")
@@ -236,9 +258,20 @@ class Database:
             async with self._connection.execute(
                 """
                 SELECT id, title, last_bumped FROM threads
-                WHERE last_bumped IS NULL
-                   OR datetime(last_bumped, '+' || ? || ' minutes') <= datetime('now')
-                ORDER BY last_bumped ASC NULLS FIRST
+                WHERE last_attempt IS NULL
+                   OR datetime(
+                        last_attempt,
+                        '+' || (? * CASE
+                            WHEN fail_streak <= 0 THEN 1
+                            WHEN fail_streak = 1 THEN 2
+                            WHEN fail_streak = 2 THEN 4
+                            WHEN fail_streak = 3 THEN 8
+                            WHEN fail_streak = 4 THEN 16
+                            WHEN fail_streak = 5 THEN 32
+                            ELSE 60
+                        END) || ' minutes'
+                      ) <= datetime('now')
+                ORDER BY last_attempt ASC NULLS FIRST
                 """,
                 (interval_minutes,),
             ) as cursor:
@@ -248,16 +281,41 @@ class Database:
             logger.error(f"Error fetching threads to bump: {e}")
             raise
 
-    async def update_last_bumped(self, thread_id: str) -> None:
+    async def record_bump_success(self, thread_id: str) -> None:
+        """Mark a thread as successfully bumped and reset its failure backoff."""
         self._ensure_connected()
         try:
             await self._connection.execute(
-                "UPDATE threads SET last_bumped = datetime('now') WHERE id = ?",
+                """
+                UPDATE threads SET
+                    last_bumped = datetime('now'),
+                    last_attempt = datetime('now'),
+                    fail_streak = 0
+                WHERE id = ?
+                """,
                 (thread_id,),
             )
             await self._connection.commit()
         except Exception as e:
-            logger.error(f"Error updating last_bumped for thread {thread_id}: {e}")
+            logger.error(f"Error recording bump success for thread {thread_id}: {e}")
+            raise
+
+    async def record_bump_failure(self, thread_id: str) -> None:
+        """Record a failed bump attempt and increase its retry backoff."""
+        self._ensure_connected()
+        try:
+            await self._connection.execute(
+                """
+                UPDATE threads SET
+                    last_attempt = datetime('now'),
+                    fail_streak = fail_streak + 1
+                WHERE id = ?
+                """,
+                (thread_id,),
+            )
+            await self._connection.commit()
+        except Exception as e:
+            logger.error(f"Error recording bump failure for thread {thread_id}: {e}")
             raise
 
     async def delete_thread(self, thread_id: str) -> bool:

@@ -306,6 +306,7 @@ class APIClient:
                         wait = self._rate_limit_wait_seconds(resp.headers, body)
                         wait = wait if wait is not None else DEFAULT_429_WAIT_SECONDS
                         wait = min(wait, MAX_RATE_LIMIT_WAIT_SECONDS)
+                        last_error = f"rate limited (429), waited {wait:.0f}s"
                         logger.warning(f"Batch rate-limited (429), waiting {wait:.0f}s (attempt {attempt + 1})")
                         await asyncio.sleep(wait)
                         continue
@@ -357,6 +358,7 @@ class APIClient:
                         wait = self._rate_limit_wait_seconds(resp.headers, body)
                         wait = wait if wait is not None else DEFAULT_429_WAIT_SECONDS
                         wait = min(wait, MAX_RATE_LIMIT_WAIT_SECONDS)
+                        last_error = f"rate limited (429), waited {wait:.0f}s"
                         logger.warning(f"GET {path} rate-limited (429), waiting {wait:.0f}s")
                         await asyncio.sleep(wait)
                         continue
